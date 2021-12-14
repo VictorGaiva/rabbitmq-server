@@ -68,6 +68,12 @@
        migration_fun => {?MODULE, user_limits_migration}
      }}).
 
+-rabbit_feature_flag(
+    {feature_flags_v2,
+     #{desc          => "Feature flags subsystem V2",
+       stability     => stable
+     }}).
+
 classic_mirrored_queue_version_migration(_FeatureName, _FeatureProps, _Enable) ->
     ok.
 
