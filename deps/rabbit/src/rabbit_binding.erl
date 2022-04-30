@@ -20,7 +20,8 @@
          remove_for_destination/2, remove_transient_for_destination/1,
          remove_default_exchange_binding_rows_of/1]).
 
--export([implicit_for_destination/1, reverse_binding/1]).
+-export([implicit_for_destination/1, reverse_binding/1,
+         index_route_table_definition/0, populate_index_route_table/0]).
 -export([new/4]).
 
 -define(DEFAULT_EXCHANGE(VHostPath), #resource{virtual_host = VHostPath,
@@ -124,7 +125,7 @@ recover_semi_durable_route_txn(R = #route{binding = B}, X) ->
       fun () ->
               case mnesia:read(rabbit_semi_durable_route, B, read) of
                   [] -> no_recover;
-                  _  -> ok = sync_transient_route(R, index_table(X), fun mnesia:write/3),
+                  _  -> ok = sync_transient_route(R, should_index_table(X), fun mnesia:write/3),
                         rabbit_exchange:serial(X)
               end
       end,
@@ -179,7 +180,7 @@ add(Binding, InnerFun, ActingUser) ->
 
 add(Src, Dst, B, ActingUser) ->
     ok = sync_route(#route{binding = B}, durable(Src), durable(Dst),
-                    index_table(Src), fun mnesia:write/3),
+                    should_index_table(Src), fun mnesia:write/3),
     x_callback(transaction, Src, add_binding, B),
     Serial = rabbit_exchange:serial(Src),
     fun () ->
@@ -220,7 +221,7 @@ remove(Binding, InnerFun, ActingUser) ->
 
 remove(Src, Dst, B, ActingUser) ->
     ok = sync_route(#route{binding = B}, durable(Src), durable(Dst),
-                    index_table(Src), fun delete/3),
+                    should_index_table(Src), fun delete/3),
     Deletions = maybe_auto_delete(
                   B#binding.source, [B], new_deletions(), false),
     process_deletions(Deletions, ActingUser).
@@ -404,7 +405,7 @@ has_for_source(SrcName) ->
     bindings().
 
 remove_for_source(#exchange{name = SrcName} = SrcX) ->
-    remove_for_source(SrcName, index_table(SrcX));
+    remove_for_source(SrcName, should_index_table(SrcX));
 remove_for_source(SrcName) ->
     remove_for_source(SrcName, undefined).
 
@@ -438,19 +439,6 @@ durable(#exchange{durable = D}) -> D;
 durable(Q) when ?is_amqqueue(Q) ->
     amqqueue:is_durable(Q).
 
-%% Only the direct exchange type uses the rabbit_index_route table to store its
-%% bindings by table key tuple {SourceExchange, RoutingKey}.
-%% Other built-in exchange types lookup destinations by SourceExchange.
-%% Therefore, we avoid inserting and deleting into rabbit_index_route for other exchange
-%% types to reduce write lock conflicts on the same tuple {SourceExchange, RoutingKey},
-%% and therefore to reduce the number of restarted Mnesia transactions.
-index_table(#exchange{name = #resource{name = Name},
-                      type = direct})
-  when Name =/= <<>> ->
-    true;
-index_table(_) ->
-    false.
-
 binding_action(Binding = #binding{source      = SrcName,
                                   destination = DstName,
                                   args        = Arguments}, Fun, ErrFun) ->
@@ -478,7 +466,12 @@ sync_transient_route(Route, WithIndex, Fun) ->
     sync_index_route(Route, WithIndex, Fun).
 
 sync_index_route(Route, true, Fun) ->
-    ok = Fun(rabbit_index_route, index_route(Route), write);
+    case rabbit_feature_flags:is_enabled(direct_exchange_routing_v2) of
+        true ->
+            ok = Fun(rabbit_index_route, index_route(Route), write);
+        _ ->
+            ok
+    end;
 sync_index_route(_, _, _) ->
     ok.
 
@@ -556,7 +549,7 @@ remove_routes(Routes, WithIndex) ->
             [begin
                  case rabbit_exchange:lookup(Src) of
                      {ok, X} ->
-                         ok = sync_index_route(R, index_table(X), fun delete/3);
+                         ok = sync_index_route(R, should_index_table(X), fun delete/3);
                      _ ->
                          ok
                  end
@@ -574,7 +567,7 @@ delete(Tab, #index_route{} = Record, LockKind) ->
 remove_transient_routes(Routes) ->
     lists:map(fun(#route{binding = #binding{source = Src} = Binding} = Route) ->
                       {ok, X} = rabbit_exchange:lookup(Src),
-                      ok = sync_transient_route(Route, index_table(X), fun delete/3),
+                      ok = sync_transient_route(Route, should_index_table(X), fun delete/3),
                       Binding
               end, Routes).
 
@@ -742,3 +735,50 @@ del_notify(Bs, ActingUser) -> [rabbit_event:notify(
 
 x_callback(Serial, X, F, Bs) ->
     ok = rabbit_exchange:callback(X, F, Serial, [X, Bs]).
+
+-spec index_route_table_definition() -> list(tuple()).
+index_route_table_definition() ->
+    maps:to_list(
+      #{
+        record_name => index_route,
+        attributes  => record_info(fields, index_route),
+        type => bag,
+        ram_copies => rabbit_nodes:all(),
+        storage_properties => [{ets, [{read_concurrency, true}]}]
+       }).
+
+populate_index_route_table() ->
+    rabbit_misc:execute_mnesia_transaction(
+      fun () ->
+              mnesia:lock({table, rabbit_route}, read),
+              mnesia:lock({table, rabbit_index_route}, write),
+              Routes = rabbit_misc:dirty_read_all(rabbit_route),
+              lists:foreach(fun(#route{binding = #binding{source = Exchange}} = Route) ->
+                                    case rabbit_exchange:lookup(Exchange) of
+                                        {ok, X} ->
+                                            case should_index_table(X) of
+                                                true ->
+                                                    mnesia:dirty_write(rabbit_index_route,
+                                                                       index_route(Route));
+                                                false ->
+                                                    ok
+                                            end;
+                                        _ ->
+                                            ok
+                                    end
+                            end, Routes)
+      end).
+
+%% Only the direct exchange type uses the rabbit_index_route table to store its
+%% bindings by table key tuple {SourceExchange, RoutingKey}.
+%% Other built-in exchange types lookup destinations by SourceExchange, and
+%% therefore will not need to read from the rabbit_index_route index table.
+%% Therefore, we avoid inserting and deleting into rabbit_index_route for other exchange
+%% types. This reduces write lock conflicts on the same tuple {SourceExchange, RoutingKey}
+%% reducing the number of restarted Mnesia transactions.
+should_index_table(#exchange{name = #resource{name = Name},
+                      type = direct})
+  when Name =/= <<>> ->
+    true;
+should_index_table(_) ->
+    false.
