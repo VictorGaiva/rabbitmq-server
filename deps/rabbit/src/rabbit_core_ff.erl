@@ -7,9 +7,7 @@
 
 -module(rabbit_core_ff).
 
--export([classic_mirrored_queue_version_migration/3,
-         quorum_queue_migration/3,
-         stream_queue_migration/3,
+-export([quorum_queue_migration/3,
          implicit_default_bindings_migration/3,
          virtual_host_metadata_migration/3,
          maintenance_mode_status_migration/3,
@@ -18,8 +16,7 @@
 -rabbit_feature_flag(
    {classic_mirrored_queue_version,
     #{desc          => "Support setting version for classic mirrored queues",
-      stability     => stable,
-      migration_fun => {?MODULE, classic_mirrored_queue_version_migration}
+      stability     => stable
      }}).
 
 -rabbit_feature_flag(
@@ -35,8 +32,7 @@
     #{desc          => "Support queues of type `stream`",
       doc_url       => "https://www.rabbitmq.com/stream.html",
       stability     => stable,
-      depends_on    => [quorum_queue],
-      migration_fun => {?MODULE, stream_queue_migration}
+      depends_on    => [quorum_queue]
      }}).
 
 -rabbit_feature_flag(
@@ -74,9 +70,6 @@
        stability     => stable
      }}).
 
-classic_mirrored_queue_version_migration(_FeatureName, _FeatureProps, _Enable) ->
-    ok.
-
 %% -------------------------------------------------------------------
 %% Quorum queues.
 %% -------------------------------------------------------------------
@@ -95,9 +88,6 @@ quorum_queue_migration(_FeatureName, _FeatureProps, is_enabled) ->
     Fields = amqqueue:fields(amqqueue_v2),
     mnesia:table_info(rabbit_queue, attributes) =:= Fields andalso
     mnesia:table_info(rabbit_durable_queue, attributes) =:= Fields.
-
-stream_queue_migration(_FeatureName, _FeatureProps, _Enable) ->
-    ok.
 
 migrate_to_amqqueue_with_type(FeatureName, [Table | Rest], Fields) ->
     rabbit_log_feature_flags:info(
